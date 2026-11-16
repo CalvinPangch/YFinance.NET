@@ -32,8 +32,8 @@ public interface IPriceRepair
     /// Performs comprehensive price repair including all error types.
     /// </summary>
     /// <param name="prices">Array of prices</param>
-    /// <param name="dates">Corresponding dates</param>
-    /// <param name="splitDates">Known split dates and ratios</param>
+    /// <param name="dates">Corresponding bar dates in the exchange's local timezone (used to locate known splits)</param>
+    /// <param name="splitDates">Known split dates (exchange-local) and ratios</param>
     /// <returns>Fully repaired prices</returns>
     decimal[] RepairPrices(decimal[] prices, DateTime[] dates, Dictionary<DateTime, decimal>? splitDates = null);
 }

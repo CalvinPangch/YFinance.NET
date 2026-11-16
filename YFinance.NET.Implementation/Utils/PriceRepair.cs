@@ -9,29 +9,28 @@ namespace YFinance.NET.Implementation.Utils;
 /// </summary>
 public class PriceRepair : IPriceRepair
 {
-    private const decimal HundredXThreshold = 95m; // Rounded to nearest 20, this captures 80-120 range
     private const decimal OutlierThreshold = 5m; // 5x deviation from median
     private const int MedianWindowSize = 5; // Window size for median filter
 
     /// <summary>
     /// Detects and repairs 100x currency conversion errors in price data.
     /// </summary>
+    /// <remarks>
+    /// Runs of any length that are 100x off (e.g. a listing switching between pounds and pence) are
+    /// rescaled to the level of the most recent data, which is assumed to be correct. Remaining isolated
+    /// 100x spikes or dips are then fixed against a rolling median.
+    /// </remarks>
     /// <param name="prices">Array of prices to repair.</param>
     /// <returns>Repaired prices with 100x errors corrected.</returns>
     public decimal[] Repair100xErrors(decimal[] prices)
     {
+        ArgumentNullException.ThrowIfNull(prices);
+
         if (prices.Length == 0)
             return prices;
 
-        var repaired = (decimal[])prices.Clone();
-
-        // First pass: Fix sporadic 100x errors using median filter approach
-        repaired = FixSporadic100xErrors(repaired);
-
-        // Second pass: Fix block 100x errors (currency unit switches)
-        repaired = FixBlock100xErrors(repaired);
-
-        return repaired;
+        var repaired = FixUnitSwitches(prices);
+        return FixSporadic100xErrors(repaired);
     }
 
     /// <summary>
@@ -51,17 +50,65 @@ public class PriceRepair : IPriceRepair
             if (repaired[i] <= 0m || medianFiltered[i] <= 0m)
                 continue;
 
-            var ratio = repaired[i] / medianFiltered[i];
-            var roundedRatio = RoundToNearest20(ratio);
+            repaired[i] *= GetHundredXCorrection(repaired[i] / medianFiltered[i]);
+        }
 
-            // Check if ratio is approximately 100 or 0.01 (1/100)
-            if (Math.Abs(roundedRatio - 100m) < 20m)
+        return repaired;
+    }
+
+    /// <summary>
+    /// Detects and fixes block 100x errors (currency unit switches), including multiple switches and
+    /// runs of any length. Each bar-to-bar jump of ~100x (or ~1/100x) moves the "unit level"; every bar
+    /// is then rescaled to the level of the last bar. Mirrors Python yfinance's _fix_unit_switch method.
+    /// </summary>
+    private static decimal[] FixUnitSwitches(decimal[] prices)
+    {
+        var repaired = (decimal[])prices.Clone();
+        if (prices.Length < 2)
+            return repaired;
+
+        // level[i]: how many factors of 100 bar i sits above the first valid bar.
+        var levels = new int[prices.Length];
+        var currentLevel = 0;
+        var lastValidIndex = -1;
+        var anySwitch = false;
+
+        for (int i = 0; i < prices.Length; i++)
+        {
+            if (prices[i] > 0m && lastValidIndex >= 0)
             {
-                repaired[i] = repaired[i] / 100m;
+                var correction = GetHundredXCorrection(prices[i] / prices[lastValidIndex]);
+                if (correction < 1m)
+                {
+                    currentLevel++;
+                    anySwitch = true;
+                }
+                else if (correction > 1m)
+                {
+                    currentLevel--;
+                    anySwitch = true;
+                }
             }
-            else if (Math.Abs(roundedRatio - 0.01m) < 0.002m)
+
+            if (prices[i] > 0m)
+                lastValidIndex = i;
+
+            levels[i] = currentLevel;
+        }
+
+        if (!anySwitch)
+            return repaired;
+
+        var referenceLevel = currentLevel;
+        for (int i = 0; i < repaired.Length; i++)
+        {
+            if (repaired[i] <= 0m)
+                continue;
+
+            var diff = levels[i] - referenceLevel;
+            for (int k = 0; k < Math.Abs(diff); k++)
             {
-                repaired[i] = repaired[i] * 100m;
+                repaired[i] = diff > 0 ? repaired[i] / 100m : repaired[i] * 100m;
             }
         }
 
@@ -69,53 +116,22 @@ public class PriceRepair : IPriceRepair
     }
 
     /// <summary>
-    /// Detects and fixes block 100x errors (permanent currency unit switches).
-    /// Mirrors Python yfinance's _fix_unit_switch method.
+    /// Returns the multiplier that corrects a value whose ratio to its reference is ~100x (0.01)
+    /// or ~1/100x (100), or 1 when the ratio does not indicate a 100x error.
+    /// The ratio is rounded to the nearest 20 to classify it (mirrors the Python approach).
     /// </summary>
-    private static decimal[] FixBlock100xErrors(decimal[] prices)
+    private static decimal GetHundredXCorrection(decimal ratio)
     {
-        if (prices.Length < 2)
-            return prices;
+        if (ratio <= 0m)
+            return 1m;
 
-        var repaired = (decimal[])prices.Clone();
+        if (RoundToNearest20(ratio) == 100m)
+            return 0.01m;
 
-        // Find the most common price level (excluding zeros)
-        var nonZeroPrices = repaired.Where(p => p > 0m).ToArray();
-        if (nonZeroPrices.Length == 0)
-            return repaired;
+        if (RoundToNearest20(1m / ratio) == 100m)
+            return 100m;
 
-        var medianPrice = CalculateMedian(nonZeroPrices);
-
-        // Check for systematic 100x error by comparing segments
-        int midPoint = repaired.Length / 2;
-        var firstHalfMedian = CalculateMedian(repaired.Take(midPoint).Where(p => p > 0m).ToArray());
-        var secondHalfMedian = CalculateMedian(repaired.Skip(midPoint).Where(p => p > 0m).ToArray());
-
-        if (firstHalfMedian > 0m && secondHalfMedian > 0m)
-        {
-            var ratio = firstHalfMedian / secondHalfMedian;
-
-            // If first half is ~100x second half, divide first half by 100
-            if (ratio >= HundredXThreshold && ratio <= 105m)
-            {
-                for (int i = 0; i < midPoint; i++)
-                {
-                    if (repaired[i] > 0m)
-                        repaired[i] /= 100m;
-                }
-            }
-            // If second half is ~100x first half, divide second half by 100
-            else if (ratio <= 1m / HundredXThreshold && ratio >= 1m / 105m)
-            {
-                for (int i = midPoint; i < repaired.Length; i++)
-                {
-                    if (repaired[i] > 0m)
-                        repaired[i] /= 100m;
-                }
-            }
-        }
-
-        return repaired;
+        return 1m;
     }
 
     /// <summary>
@@ -153,6 +169,8 @@ public class PriceRepair : IPriceRepair
     /// <returns>Repaired prices with zeros filled.</returns>
     public decimal[] RepairZeroValues(decimal[] prices)
     {
+        ArgumentNullException.ThrowIfNull(prices);
+
         if (prices.Length == 0)
             return prices;
 
@@ -197,6 +215,9 @@ public class PriceRepair : IPriceRepair
     /// <returns>Repaired prices with split errors corrected.</returns>
     public decimal[] RepairBadSplits(decimal[] prices, Dictionary<DateTime, decimal> splitDates)
     {
+        ArgumentNullException.ThrowIfNull(prices);
+        ArgumentNullException.ThrowIfNull(splitDates);
+
         if (prices.Length == 0 || splitDates.Count == 0)
             return prices;
 
@@ -236,20 +257,26 @@ public class PriceRepair : IPriceRepair
     /// Applies comprehensive price repairs including zero values, 100x errors, outliers, and splits.
     /// </summary>
     /// <param name="prices">Array of prices to repair.</param>
-    /// <param name="dates">Array of dates corresponding to prices.</param>
-    /// <param name="splitDates">Optional dictionary mapping split dates to split ratios.</param>
+    /// <param name="dates">Bar dates in the exchange's local timezone, corresponding to prices.</param>
+    /// <param name="splitDates">Optional dictionary mapping exchange-local split dates to split ratios.</param>
     /// <returns>Fully repaired prices.</returns>
     public decimal[] RepairPrices(decimal[] prices, DateTime[] dates, Dictionary<DateTime, decimal>? splitDates = null)
     {
+        ArgumentNullException.ThrowIfNull(prices);
+        ArgumentNullException.ThrowIfNull(dates);
+
         var repaired = RepairZeroValues(prices);
+
+        // Undo known splits first so a genuine 100:1 (reverse) split is not mistaken for a currency switch
+        // and the outlier filter does not see split steps.
+        if (splitDates != null && splitDates.Count > 0)
+            repaired = AdjustForKnownSplits(repaired, dates, splitDates);
+
         repaired = Repair100xErrors(repaired);
         repaired = RepairOutliers(repaired);
 
         if (splitDates != null && splitDates.Count > 0)
-        {
-            repaired = AdjustForKnownSplits(repaired, dates, splitDates);
             repaired = RepairBadSplits(repaired, splitDates);
-        }
 
         return repaired;
     }
@@ -315,7 +342,8 @@ public class PriceRepair : IPriceRepair
             if (splitRatio <= 0m)
                 continue;
 
-            var index = Array.FindLastIndex(dates, date => date.Date <= splitDate);
+            // First bar trading on or after the split date (the split may fall on a non-trading day).
+            var index = Array.FindIndex(dates, date => date.Date >= splitDate);
             if (index <= 0 || index >= repaired.Length)
                 continue;
 

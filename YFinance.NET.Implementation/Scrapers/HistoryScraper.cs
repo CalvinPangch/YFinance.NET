@@ -257,16 +257,38 @@ public class HistoryScraper : IHistoryScraper
             }
         }
 
-        var timestampArray = _timezoneHelper.FixDstIssues(timestamps.ToArray(), timezone);
+        // Yahoo's DST error only affects daily-or-longer bars; intraday timestamps must be left as-is.
+        var timestampArray = IsDailyOrLonger(request.Interval)
+            ? _timezoneHelper.FixDstIssues(timestamps.ToArray(), timezone)
+            : timestamps.ToArray();
+
+        // Calendar dates of each bar in the exchange's timezone. Event dates (splits/dividends) are keyed
+        // by exchange-local date too, so matching on UTC dates would be off by a day for non-UTC exchanges.
+        var exchangeDates = timestampArray
+            .Select(ts => DateTime.SpecifyKind(_timezoneHelper.ConvertToExchangeTime(ts, timezone).Date, DateTimeKind.Utc))
+            .ToArray();
 
         // Apply price repair if requested
         if (request.Repair)
         {
-            open = _priceRepair.RepairPrices(open, timestampArray, splitsByDate);
-            high = _priceRepair.RepairPrices(high, timestampArray, splitsByDate);
-            low = _priceRepair.RepairPrices(low, timestampArray, splitsByDate);
-            close = _priceRepair.RepairPrices(close, timestampArray, splitsByDate);
-            adjClose = _priceRepair.RepairPrices(adjClose, timestampArray, splitsByDate);
+            var adjFactors = hasAdjClose ? ComputeAdjustmentFactors(close, adjClose) : null;
+
+            open = _priceRepair.RepairPrices(open, exchangeDates, splitsByDate);
+            high = _priceRepair.RepairPrices(high, exchangeDates, splitsByDate);
+            low = _priceRepair.RepairPrices(low, exchangeDates, splitsByDate);
+            close = _priceRepair.RepairPrices(close, exchangeDates, splitsByDate);
+            EnforceOhlcConsistency(open, high, low, close);
+
+            if (adjFactors != null)
+            {
+                // Keep Yahoo's adjClose/close ratio rather than repairing adjClose independently.
+                var repairedAdjClose = _priceRepair.RepairPrices(adjClose, exchangeDates, splitsByDate);
+                adjClose = ApplyAdjustmentFactors(close, adjFactors, repairedAdjClose);
+            }
+            else
+            {
+                adjClose = close;
+            }
         }
 
         // Auto-adjust prices using adjusted close ratio when available
@@ -278,14 +300,14 @@ public class HistoryScraper : IHistoryScraper
             }
             else
             {
-                ApplyCorporateActions(open, high, low, close, timestampArray, dividendsByDate, splitsByDate);
+                ApplyCorporateActions(open, high, low, close, exchangeDates, dividendsByDate, splitsByDate);
                 adjClose = close;
             }
         }
 
         if (request.Interval == Interval.OneWeek || request.Interval == Interval.OneMonth || request.Interval == Interval.ThreeMonths)
         {
-            return ResampleHistoricalData(symbol, timestampArray, open, high, low, close, adjClose, volume, dividends, splits, capitalGains, timezone, request.Interval);
+            return ResampleHistoricalData(symbol, timestampArray, exchangeDates, open, high, low, close, adjClose, volume, dividends, splits, capitalGains, timezone, request.Interval);
         }
 
         return new HistoricalData
@@ -374,6 +396,55 @@ public class HistoryScraper : IHistoryScraper
         return DateTimeOffset.FromUnixTimeSeconds(value.GetInt64()).UtcDateTime;
     }
 
+    private static bool IsDailyOrLonger(Interval interval)
+    {
+        return interval is Interval.OneDay or Interval.FiveDays or Interval.OneWeek
+            or Interval.OneMonth or Interval.ThreeMonths;
+    }
+
+    private static decimal?[] ComputeAdjustmentFactors(decimal[] close, decimal[] adjClose)
+    {
+        var factors = new decimal?[close.Length];
+        for (int i = 0; i < close.Length && i < adjClose.Length; i++)
+        {
+            if (close[i] > 0m && adjClose[i] > 0m)
+                factors[i] = adjClose[i] / close[i];
+        }
+
+        return factors;
+    }
+
+    private static decimal[] ApplyAdjustmentFactors(decimal[] close, decimal?[] factors, decimal[] fallback)
+    {
+        var result = new decimal[close.Length];
+        for (int i = 0; i < close.Length; i++)
+        {
+            result[i] = factors[i] is decimal factor
+                ? close[i] * factor
+                : (i < fallback.Length ? fallback[i] : 0m);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Series are repaired independently, so make sure each bar still satisfies
+    /// Low &lt;= Open, Close &lt;= High.
+    /// </summary>
+    private static void EnforceOhlcConsistency(decimal[] open, decimal[] high, decimal[] low, decimal[] close)
+    {
+        var length = new[] { open.Length, high.Length, low.Length, close.Length }.Min();
+        for (int i = 0; i < length; i++)
+        {
+            var values = new[] { open[i], high[i], low[i], close[i] }.Where(v => v > 0m).ToArray();
+            if (values.Length == 0)
+                continue;
+
+            high[i] = values.Max();
+            low[i] = values.Min();
+        }
+    }
+
     private static void ApplyAutoAdjust(decimal[] open, decimal[] high, decimal[] low, decimal[] close, decimal[] adjClose)
     {
         var length = Math.Min(close.Length, adjClose.Length);
@@ -447,6 +518,7 @@ public class HistoryScraper : IHistoryScraper
     private static HistoricalData ResampleHistoricalData(
         string symbol,
         DateTime[] timestamps,
+        DateTime[] exchangeDates,
         decimal[] open,
         decimal[] high,
         decimal[] low,
@@ -480,7 +552,7 @@ public class HistoryScraper : IHistoryScraper
 
         var grouped = timestamps
             .Select((ts, idx) => new { ts, idx })
-            .GroupBy(item => GetBucketStart(item.ts, interval))
+            .GroupBy(item => GetBucketStart(exchangeDates[item.idx], interval))
             .OrderBy(group => group.Key)
             .ToList();
 
@@ -543,11 +615,11 @@ public class HistoryScraper : IHistoryScraper
         decimal[] high,
         decimal[] low,
         decimal[] close,
-        DateTime[] timestamps,
+        DateTime[] exchangeDates,
         Dictionary<DateTime, decimal> dividends,
         Dictionary<DateTime, decimal> splits)
     {
-        var length = new[] { timestamps.Length, open.Length, high.Length, low.Length, close.Length }.Min();
+        var length = new[] { exchangeDates.Length, open.Length, high.Length, low.Length, close.Length }.Min();
         if (length == 0)
             return;
 
@@ -557,7 +629,7 @@ public class HistoryScraper : IHistoryScraper
         decimal factor = 1m;
         for (int i = length - 1; i >= 0; i--)
         {
-            var date = timestamps[i].Date;
+            var date = exchangeDates[i].Date;
             open[i] *= factor;
             high[i] *= factor;
             low[i] *= factor;

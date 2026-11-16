@@ -12,10 +12,13 @@ public interface ITimezoneHelper
     /// <param name="utcDateTime">DateTime in UTC</param>
     /// <param name="timeZoneId">IANA timezone identifier (e.g., "America/New_York")</param>
     /// <returns>DateTime in exchange timezone</returns>
+    /// <exception cref="ArgumentException">Thrown when the timezone ID is not recognised.</exception>
     DateTime ConvertToExchangeTime(DateTime utcDateTime, string timeZoneId);
 
     /// <summary>
-    /// Fixes Yahoo Finance DST issues in historical data.
+    /// Fixes Yahoo Finance DST issues in daily (or longer) bar timestamps, where a bar is reported
+    /// just before local midnight instead of at the start of the intended day.
+    /// Must not be applied to intraday data.
     /// </summary>
     /// <param name="timestamps">Array of timestamps to fix</param>
     /// <param name="timeZoneId">IANA timezone identifier</param>

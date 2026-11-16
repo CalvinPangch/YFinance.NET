@@ -32,6 +32,10 @@ public class HistoryScraperTests
             .Setup(t => t.FixDstIssues(It.IsAny<DateTime[]>(), It.IsAny<string>()))
             .Returns<DateTime[], string>((timestamps, _) => timestamps);
 
+        _mockTimezoneHelper
+            .Setup(t => t.ConvertToExchangeTime(It.IsAny<DateTime>(), It.IsAny<string>()))
+            .Returns<DateTime, string>((dt, _) => DateTime.SpecifyKind(dt, DateTimeKind.Unspecified));
+
         _mockPriceRepair
             .Setup(p => p.RepairPrices(It.IsAny<decimal[]>(), It.IsAny<DateTime[]>(), It.IsAny<Dictionary<DateTime, decimal>?>()))
             .Returns<decimal[], DateTime[], Dictionary<DateTime, decimal>?>((prices, _, _) => prices);
@@ -558,6 +562,91 @@ public class HistoryScraperTests
         capturedParams!["events"].Should().Be("div,split");
         capturedParams["includePrePost"].Should().Be("false");
     }
+
+    #endregion
+
+    #region Timezone And Repair
+
+    [Theory]
+    [InlineData(Interval.FiveMinutes)]
+    [InlineData(Interval.OneHour)]
+    public async Task GetHistoryAsync_IntradayInterval_DoesNotApplyDailyDstFix(Interval interval)
+    {
+        SetupChartResponse(new PriceBar(new DateTime(2024, 1, 10, 15, 0, 0, DateTimeKind.Utc), 1m, 1m, 1m, 1m, 1));
+        var scraper = CreateScraperWithRealParser();
+
+        var result = await scraper.GetHistoryAsync("AAPL", new HistoryRequest { Period = Period.OneDay, Interval = interval });
+
+        _mockTimezoneHelper.Verify(t => t.FixDstIssues(It.IsAny<DateTime[]>(), It.IsAny<string>()), Times.Never);
+        result.Timestamps[0].Should().Be(new DateTime(2024, 1, 10, 15, 0, 0, DateTimeKind.Utc));
+    }
+
+    [Fact]
+    public async Task GetHistoryAsync_DailyInterval_AppliesDstFix()
+    {
+        SetupChartResponse(new PriceBar(new DateTime(2024, 1, 10, 14, 30, 0, DateTimeKind.Utc), 1m, 1m, 1m, 1m, 1));
+        var scraper = CreateScraperWithRealParser();
+
+        await scraper.GetHistoryAsync("AAPL", new HistoryRequest { Period = Period.OneMonth, Interval = Interval.OneDay });
+
+        _mockTimezoneHelper.Verify(t => t.FixDstIssues(It.IsAny<DateTime[]>(), It.IsAny<string>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task GetHistoryAsync_Repair_PassesExchangeLocalDatesToPriceRepair()
+    {
+        // 01:00 UTC on Jan 2 is still Jan 1 (20:00) in New York
+        SetupChartResponse(new PriceBar(new DateTime(2024, 1, 2, 1, 0, 0, DateTimeKind.Utc), 1m, 1m, 1m, 1m, 1));
+        DateTime[]? capturedDates = null;
+        _mockPriceRepair
+            .Setup(p => p.RepairPrices(It.IsAny<decimal[]>(), It.IsAny<DateTime[]>(), It.IsAny<Dictionary<DateTime, decimal>?>()))
+            .Callback<decimal[], DateTime[], Dictionary<DateTime, decimal>?>((_, dates, _) => capturedDates = dates)
+            .Returns<decimal[], DateTime[], Dictionary<DateTime, decimal>?>((prices, _, _) => prices);
+
+        var scraper = new HistoryScraper(
+            _mockClient.Object, new DataParser(), _mockPriceRepair.Object, new TimezoneHelper(), _mockSymbolValidator.Object);
+
+        await scraper.GetHistoryAsync("AAPL", new HistoryRequest { Period = Period.OneMonth, Interval = Interval.OneDay, Repair = true });
+
+        capturedDates.Should().NotBeNull();
+        capturedDates![0].Date.Should().Be(new DateTime(2024, 1, 1));
+    }
+
+    [Fact]
+    public async Task GetHistoryAsync_Repair_KeepsOhlcConsistentAndPreservesAdjCloseRatio()
+    {
+        SetupChartResponse(new PriceBar(new DateTime(2024, 1, 10, 14, 30, 0, DateTimeKind.Utc), 100m, 110m, 90m, 105m, 1));
+
+        // Repair lowers High below Close (as an independent per-series repair could)
+        _mockPriceRepair
+            .SetupSequence(p => p.RepairPrices(It.IsAny<decimal[]>(), It.IsAny<DateTime[]>(), It.IsAny<Dictionary<DateTime, decimal>?>()))
+            .Returns(new[] { 100m })   // open
+            .Returns(new[] { 102m })   // high
+            .Returns(new[] { 90m })    // low
+            .Returns(new[] { 104m })   // close
+            .Returns(new[] { 999m });  // adjClose (independent repair, should not be used)
+
+        var scraper = CreateScraperWithRealParser();
+
+        var result = await scraper.GetHistoryAsync("AAPL", new HistoryRequest { Period = Period.OneMonth, Interval = Interval.OneDay, Repair = true });
+
+        result.High[0].Should().Be(104m);
+        result.Low[0].Should().Be(90m);
+        // Builder sets adjclose == close, so the ratio is 1 and adjClose follows the repaired close.
+        result.AdjustedClose[0].Should().Be(104m);
+    }
+
+    private void SetupChartResponse(params PriceBar[] bars)
+    {
+        _mockClient.Setup(c => c.GetAsync(
+                It.IsAny<string>(),
+                It.IsAny<Dictionary<string, string>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TestDataBuilder.BuildValidChartResponse("AAPL", bars));
+    }
+
+    private HistoryScraper CreateScraperWithRealParser() =>
+        new(_mockClient.Object, new DataParser(), _mockPriceRepair.Object, _mockTimezoneHelper.Object, _mockSymbolValidator.Object);
 
     #endregion
 

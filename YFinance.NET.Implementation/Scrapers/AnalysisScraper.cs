@@ -203,46 +203,19 @@ public class AnalysisScraper : IAnalysisScraper
 
     private RecommendationsSummaryData ParseRecommendationsSummary(string symbol, string jsonResponse)
     {
-        using var document = JsonDocument.Parse(jsonResponse);
-        var root = document.RootElement;
-
-        var summaryData = new RecommendationsSummaryData { Symbol = symbol };
-
-        if (!root.TryGetProperty("quoteSummary", out var quoteSummary) ||
-            !quoteSummary.TryGetProperty("result", out var results) ||
-            results.GetArrayLength() == 0)
-        {
-            return summaryData;
-        }
-
-        var result = results[0];
-        if (!result.TryGetProperty("recommendationTrend", out var trend) ||
-            !trend.TryGetProperty("trend", out var trendArray) ||
-            trendArray.ValueKind != JsonValueKind.Array)
-        {
-            return summaryData;
-        }
-
-        var summaries = new List<RecommendationsSummaryEntry>();
-        foreach (var entry in trendArray.EnumerateArray())
-        {
-            var period = entry.TryGetProperty("period", out var periodElement) && periodElement.ValueKind == JsonValueKind.String
-                ? periodElement.GetString() ?? string.Empty
-                : string.Empty;
-
-            summaries.Add(new RecommendationsSummaryEntry
+        var summaries = ParseRecommendationTrend(jsonResponse)
+            .Select(entry => new RecommendationsSummaryEntry
             {
-                Period = period,
-                StrongBuy = entry.GetIntPropertyOrDefault("strongBuy"),
-                Buy = entry.GetIntPropertyOrDefault("buy"),
-                Hold = entry.GetIntPropertyOrDefault("hold"),
-                Sell = entry.GetIntPropertyOrDefault("sell"),
-                StrongSell = entry.GetIntPropertyOrDefault("strongSell")
-            });
-        }
+                Period = entry.Period,
+                StrongBuy = entry.StrongBuy,
+                Buy = entry.Buy,
+                Hold = entry.Hold,
+                Sell = entry.Sell,
+                StrongSell = entry.StrongSell
+            })
+            .ToArray();
 
-        summaryData.Summaries = summaries;
-        return summaryData;
+        return new RecommendationsSummaryData { Symbol = symbol, Summaries = summaries };
     }
 
     private IReadOnlyList<UpgradeDowngradeEntry> ParseUpgradeDowngradeHistory(string jsonResponse)

@@ -43,6 +43,37 @@ public class AnalysisScraperTests
     }
 
     [Fact]
+    public async Task GetRecommendationsSummaryAsync_ValidResponse_ReturnsSummaries()
+    {
+        _mockClient.Setup(c => c.GetAsync(
+                It.IsAny<string>(),
+                It.IsAny<Dictionary<string, string>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TestDataBuilder.BuildRecommendationTrendResponse());
+
+        var result = await _scraper.GetRecommendationsSummaryAsync("AAPL");
+
+        result.Symbol.Should().Be("AAPL");
+        result.Summaries.Should().NotBeEmpty();
+        result.Summaries[0].Period.Should().Be("0m");
+        result.Summaries[0].StrongBuy.Should().Be(5);
+    }
+
+    [Fact]
+    public async Task GetRecommendationsSummaryAsync_EmptyResult_ReturnsEmptySummaries()
+    {
+        _mockClient.Setup(c => c.GetAsync(
+                It.IsAny<string>(),
+                It.IsAny<Dictionary<string, string>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync("{\"quoteSummary\":{\"result\":[]}}");
+
+        var result = await _scraper.GetRecommendationsSummaryAsync("AAPL");
+
+        result.Summaries.Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task GetUpgradesDowngradesAsync_ValidResponse_ReturnsHistory()
     {
         var response = TestDataBuilder.BuildUpgradeDowngradeResponse();
